@@ -632,9 +632,14 @@ def _prepare_inference_rows(path_obj: Path, min_ts_map: dict):
     sym = _derive_symbol_name(path_obj)
     try:
         df = load_one(path_obj)
+        # Prefer rows newer than the last labeled panel entry, but never drop
+        # everything—fallback to the latest calendar day so watchlist always
+        # reflects freshest cache data.
         min_ts = min_ts_map.get(sym, None)
         if min_ts is not None:
-            df = df[df["timestamp"] > pd.to_datetime(min_ts)]
+            newer = df[df["timestamp"] > pd.to_datetime(min_ts)]
+            if not newer.empty:
+                df = newer
         if df.empty:
             return sym, None, "NO INFER ROWS"
         df = add_targets(df)
