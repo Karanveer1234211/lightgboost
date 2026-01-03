@@ -582,10 +582,11 @@ def last_ts_by_symbol_from_panel(panel_path: str) -> dict:
         return {}
     try:
         df = pd.read_parquet(p)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["timestamp"] = ensure_kolkata_tz(pd.to_datetime(df["timestamp"], errors="coerce"))
         df = df.dropna(subset=["timestamp"])
         last = df.sort_values(["symbol","timestamp"]).groupby("symbol")["timestamp"].tail(1)
-        return df.loc[last.index, ["symbol","timestamp"]].set_index("symbol")["timestamp"].to_dict()
+        return (df.loc[last.index, ["symbol","timestamp"]]
+                  .set_index("symbol")["timestamp"].to_dict())
     except Exception:
         return {}
 
@@ -632,12 +633,14 @@ def _prepare_inference_rows(path_obj: Path, min_ts_map: dict):
     sym = _derive_symbol_name(path_obj)
     try:
         df = load_one(path_obj)
+        df["timestamp"] = ensure_kolkata_tz(df["timestamp"])
         # Prefer rows newer than the last labeled panel entry, but never drop
         # everything—fallback to the latest calendar day so watchlist always
         # reflects freshest cache data.
-        min_ts = min_ts_map.get(sym, None)
-        if min_ts is not None:
-            newer = df[df["timestamp"] > pd.to_datetime(min_ts)]
+        min_ts_raw = min_ts_map.get(sym, None)
+        if min_ts_raw is not None:
+            min_ts = ensure_kolkata_tz(pd.Series([min_ts_raw])).iloc[0]
+            newer = df[df["timestamp"] > min_ts]
             if not newer.empty:
                 df = newer
         if df.empty:
@@ -709,7 +712,13 @@ def collect_inference_latest(paths: List[Path], min_ts_map: dict, load_workers: 
     infer = pd.concat(parts, ignore_index=True, sort=False)
     # Deduplicate to one row per symbol (latest)
     infer = infer.sort_values(["symbol","timestamp"]).groupby("symbol", as_index=False).tail(1)
-    return infer.reset_index(drop=True)
+    infer = infer.reset_index(drop=True)
+    latest_map = infer.groupby("symbol")["timestamp"].max().sort_index()
+    if not latest_map.empty:
+        print("[Inference] Latest day per symbol (override candidates):")
+        for sym, ts in latest_map.items():
+            print(f"  {sym}: {ts}")
+    return infer
 
 # ===================== Collection =====================
 def collect_panel_from_paths(paths: List[Path], load_workers: int = 1):
@@ -823,8 +832,13 @@ def collect_panel_from_paths(paths: List[Path], load_workers: int = 1):
 
     # Load back the written parquet to return a DataFrame view
     panel = pd.read_parquet(PANEL_OUT)
-    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
+    panel["timestamp"] = ensure_kolkata_tz(pd.to_datetime(panel["timestamp"], errors="coerce"))
     panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
+    latest_map = panel.groupby("symbol")["timestamp"].max().sort_index()
+    if not latest_map.empty:
+        print("\n[Load+Engineer] Latest timestamp per symbol:")
+        for sym, ts in latest_map.items():
+            print(f"  {sym}: {ts}")
     feats = [c for c in MASTER_KEEP_STATIC if (
         c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
         or c.startswith("Struct_") or c.startswith("DayType_")
