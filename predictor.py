@@ -655,8 +655,9 @@ def _prepare_inference_rows(path_obj: Path, min_ts_map: dict):
         ]
         rows = df[keep_cols].copy()
         # Keep only the latest calendar day per symbol for inference
-        latest_ts = pd.to_datetime(rows["timestamp"]).max()
-        rows = rows[pd.to_datetime(rows["timestamp"]) == latest_ts].copy()
+        ts_norm = ensure_kolkata_tz(rows["timestamp"]).dt.normalize()
+        latest_day = ts_norm.max()
+        rows = rows[ts_norm == latest_day].copy()
         return sym, rows, None
     except Exception as e:
         return sym, None, e
@@ -1146,16 +1147,36 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
     panel = panel.copy().sort_values(["symbol", "timestamp"])
     panel["avg20_vol"] = panel.groupby("symbol")["volume"].transform(lambda s: s.rolling(20, min_periods=1).mean())
 
-    # Use freshest engineered rows if provided; else fall back to panel's last labeled rows
+    base_last = panel.groupby("symbol", as_index=False).tail(1).copy()
+    # Use freshest engineered rows if provided; merge with panel tail so symbols missing
+    # from overrides still get predictions.
     if latest_override is not None and not latest_override.empty:
-        last = latest_override.copy()
-        # Compute avg20 per symbol from panel history (mean of last 20 vols)
-        avg20_map = panel.sort_values(["symbol","timestamp"]).groupby("symbol")["volume"].apply(lambda s: s.tail(20).mean())
-        last["avg20_vol"] = last["symbol"].map(avg20_map)
-        # Fill any NaNs with the current row's volume
-        last["avg20_vol"] = last["avg20_vol"].fillna(last["volume"]) if "volume" in last.columns else last["avg20_vol"].fillna(0)
+        override = latest_override.copy()
+        # Align schemas before merging
+        missing_in_override = [c for c in base_last.columns if c not in override.columns]
+        for c in missing_in_override:
+            override[c] = np.nan
+        missing_in_base = [c for c in override.columns if c not in base_last.columns]
+        for c in missing_in_base:
+            base_last[c] = np.nan
+        override = override[base_last.columns]
+        merged = pd.concat([base_last, override], ignore_index=True, sort=False)
+        merged = merged.sort_values(["symbol", "timestamp"]).groupby("symbol", as_index=False).tail(1)
+        last = merged.reset_index(drop=True)
     else:
-        last = panel.groupby("symbol", as_index=False).tail(1).copy()
+        last = base_last
+
+    # Compute avg20 per symbol from panel history (mean of last 20 vols)
+    avg20_map = panel.sort_values(["symbol","timestamp"]).groupby("symbol")["volume"].apply(lambda s: s.tail(20).mean())
+    last["avg20_vol"] = last["symbol"].map(avg20_map)
+    # Fill any NaNs with the current row's volume
+    last["avg20_vol"] = last["avg20_vol"].fillna(last["volume"]) if "volume" in last.columns else last["avg20_vol"].fillna(0)
+
+    latest_choice = last.groupby("symbol")["timestamp"].max().sort_index()
+    if not latest_choice.empty:
+        print("[Watchlist] Chosen timestamp per symbol (panel vs overrides):")
+        for sym, ts in latest_choice.items():
+            print(f"  {sym}: {ts}")
 
     X = sanitize_feature_matrix(last[feats].copy())
 
