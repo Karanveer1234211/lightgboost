@@ -617,8 +617,14 @@ def _prepare_panel_rows(path_obj: Path, min_ts_map: dict):
         df_train = df.dropna(subset=["ret_1d_close_pct"])
         if df_train.empty:
             nrows = len(df)
-            msg = (f"NO TRAIN {sym} rows={nrows} "
-                   f"req_cols_ok={all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}")
+            latest_ts = ensure_kolkata_tz(df["timestamp"]).max()
+            label_counts = {h: int(df[f"ret_{h}d_close_pct"].notna().sum()) for h in (1,3,5)}
+            msg = (
+                f"NO TRAIN {sym} rows={nrows} req_cols_ok="
+                f"{all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}"
+                f" labels={{1d:{label_counts[1]},3d:{label_counts[3]},5d:{label_counts[5]}}}"
+                f" latest_ts={latest_ts}"
+            )
             return sym, None, feats, msg
         rows = df_train[["timestamp","symbol","open","high","low","close","volume"] + feats +
                         ["ret_1d_close_pct","ret_3d_close_pct","ret_5d_close_pct",
@@ -715,10 +721,14 @@ def collect_inference_latest(paths: List[Path], min_ts_map: dict, load_workers: 
     infer = infer.sort_values(["symbol","timestamp"]).groupby("symbol", as_index=False).tail(1)
     infer = infer.reset_index(drop=True)
     latest_map = infer.groupby("symbol")["timestamp"].max().sort_index()
-    if not latest_map.empty:
+    if latest_map.empty:
+        print("[Inference] No override rows collected (cache may be missing or older than panel).")
+    else:
+        latest_overall = latest_map.max()
         print("[Inference] Latest day per symbol (override candidates):")
         for sym, ts in latest_map.items():
             print(f"  {sym}: {ts}")
+        print(f"[Inference] Max override day across symbols: {latest_overall}")
     return infer
 
 # ===================== Collection =====================
@@ -1148,10 +1158,12 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
     panel["avg20_vol"] = panel.groupby("symbol")["volume"].transform(lambda s: s.rolling(20, min_periods=1).mean())
 
     base_last = panel.groupby("symbol", as_index=False).tail(1).copy()
+    base_ts_map = base_last.set_index("symbol")["timestamp"].to_dict()
     # Use freshest engineered rows if provided; merge with panel tail so symbols missing
     # from overrides still get predictions.
     if latest_override is not None and not latest_override.empty:
         override = latest_override.copy()
+        override_ts_map = override.set_index("symbol")["timestamp"].to_dict()
         # Align schemas before merging
         missing_in_override = [c for c in base_last.columns if c not in override.columns]
         for c in missing_in_override:
@@ -1163,8 +1175,20 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
         merged = pd.concat([base_last, override], ignore_index=True, sort=False)
         merged = merged.sort_values(["symbol", "timestamp"]).groupby("symbol", as_index=False).tail(1)
         last = merged.reset_index(drop=True)
+        # Report which source won for each symbol
+        chosen_src = {}
+        for _, row in last.iterrows():
+            sym = row.get("symbol")
+            ts = row.get("timestamp")
+            bts = base_ts_map.get(sym)
+            ots = override_ts_map.get(sym)
+            if ots is not None and (bts is None or ots >= bts):
+                chosen_src[sym] = ("override", ots)
+            else:
+                chosen_src[sym] = ("panel", bts)
     else:
         last = base_last
+        chosen_src = {sym: ("panel", ts) for sym, ts in base_ts_map.items()}
 
     # Compute avg20 per symbol from panel history (mean of last 20 vols)
     avg20_map = panel.sort_values(["symbol","timestamp"]).groupby("symbol")["volume"].apply(lambda s: s.tail(20).mean())
@@ -1176,7 +1200,8 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
     if not latest_choice.empty:
         print("[Watchlist] Chosen timestamp per symbol (panel vs overrides):")
         for sym, ts in latest_choice.items():
-            print(f"  {sym}: {ts}")
+            src, sts = chosen_src.get(sym, ("?", ts))
+            print(f"  {sym}: {ts} via {src}")
 
     X = sanitize_feature_matrix(last[feats].copy())
 
