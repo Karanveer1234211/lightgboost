@@ -582,10 +582,11 @@ def last_ts_by_symbol_from_panel(panel_path: str) -> dict:
         return {}
     try:
         df = pd.read_parquet(p)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["timestamp"] = ensure_kolkata_tz(pd.to_datetime(df["timestamp"], errors="coerce"))
         df = df.dropna(subset=["timestamp"])
         last = df.sort_values(["symbol","timestamp"]).groupby("symbol")["timestamp"].tail(1)
-        return df.loc[last.index, ["symbol","timestamp"]].set_index("symbol")["timestamp"].to_dict()
+        return (df.loc[last.index, ["symbol","timestamp"]]
+                  .set_index("symbol")["timestamp"].to_dict())
     except Exception:
         return {}
 
@@ -616,8 +617,14 @@ def _prepare_panel_rows(path_obj: Path, min_ts_map: dict):
         df_train = df.dropna(subset=["ret_1d_close_pct"])
         if df_train.empty:
             nrows = len(df)
-            msg = (f"NO TRAIN {sym} rows={nrows} "
-                   f"req_cols_ok={all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}")
+            latest_ts = ensure_kolkata_tz(df["timestamp"]).max()
+            label_counts = {h: int(df[f"ret_{h}d_close_pct"].notna().sum()) for h in (1,3,5)}
+            msg = (
+                f"NO TRAIN {sym} rows={nrows} req_cols_ok="
+                f"{all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}"
+                f" labels={{1d:{label_counts[1]},3d:{label_counts[3]},5d:{label_counts[5]}}}"
+                f" latest_ts={latest_ts}"
+            )
             return sym, None, feats, msg
         rows = df_train[["timestamp","symbol","open","high","low","close","volume"] + feats +
                         ["ret_1d_close_pct","ret_3d_close_pct","ret_5d_close_pct",
@@ -632,9 +639,16 @@ def _prepare_inference_rows(path_obj: Path, min_ts_map: dict):
     sym = _derive_symbol_name(path_obj)
     try:
         df = load_one(path_obj)
-        min_ts = min_ts_map.get(sym, None)
-        if min_ts is not None:
-            df = df[df["timestamp"] > pd.to_datetime(min_ts)]
+        df["timestamp"] = ensure_kolkata_tz(df["timestamp"])
+        # Prefer rows newer than the last labeled panel entry, but never drop
+        # everything—fallback to the latest calendar day so watchlist always
+        # reflects freshest cache data.
+        min_ts_raw = min_ts_map.get(sym, None)
+        if min_ts_raw is not None:
+            min_ts = ensure_kolkata_tz(pd.Series([min_ts_raw])).iloc[0]
+            newer = df[df["timestamp"] > min_ts]
+            if not newer.empty:
+                df = newer
         if df.empty:
             return sym, None, "NO INFER ROWS"
         df = add_targets(df)
@@ -647,8 +661,9 @@ def _prepare_inference_rows(path_obj: Path, min_ts_map: dict):
         ]
         rows = df[keep_cols].copy()
         # Keep only the latest calendar day per symbol for inference
-        latest_ts = pd.to_datetime(rows["timestamp"]).max()
-        rows = rows[pd.to_datetime(rows["timestamp"]) == latest_ts].copy()
+        ts_norm = ensure_kolkata_tz(rows["timestamp"]).dt.normalize()
+        latest_day = ts_norm.max()
+        rows = rows[ts_norm == latest_day].copy()
         return sym, rows, None
     except Exception as e:
         return sym, None, e
@@ -704,7 +719,17 @@ def collect_inference_latest(paths: List[Path], min_ts_map: dict, load_workers: 
     infer = pd.concat(parts, ignore_index=True, sort=False)
     # Deduplicate to one row per symbol (latest)
     infer = infer.sort_values(["symbol","timestamp"]).groupby("symbol", as_index=False).tail(1)
-    return infer.reset_index(drop=True)
+    infer = infer.reset_index(drop=True)
+    latest_map = infer.groupby("symbol")["timestamp"].max().sort_index()
+    if latest_map.empty:
+        print("[Inference] No override rows collected (cache may be missing or older than panel).")
+    else:
+        latest_overall = latest_map.max()
+        print("[Inference] Latest day per symbol (override candidates):")
+        for sym, ts in latest_map.items():
+            print(f"  {sym}: {ts}")
+        print(f"[Inference] Max override day across symbols: {latest_overall}")
+    return infer
 
 # ===================== Collection =====================
 def collect_panel_from_paths(paths: List[Path], load_workers: int = 1):
@@ -818,8 +843,13 @@ def collect_panel_from_paths(paths: List[Path], load_workers: int = 1):
 
     # Load back the written parquet to return a DataFrame view
     panel = pd.read_parquet(PANEL_OUT)
-    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
+    panel["timestamp"] = ensure_kolkata_tz(pd.to_datetime(panel["timestamp"], errors="coerce"))
     panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
+    latest_map = panel.groupby("symbol")["timestamp"].max().sort_index()
+    if not latest_map.empty:
+        print("\n[Load+Engineer] Latest timestamp per symbol:")
+        for sym, ts in latest_map.items():
+            print(f"  {sym}: {ts}")
     feats = [c for c in MASTER_KEEP_STATIC if (
         c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
         or c.startswith("Struct_") or c.startswith("DayType_")
@@ -1127,16 +1157,51 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
     panel = panel.copy().sort_values(["symbol", "timestamp"])
     panel["avg20_vol"] = panel.groupby("symbol")["volume"].transform(lambda s: s.rolling(20, min_periods=1).mean())
 
-    # Use freshest engineered rows if provided; else fall back to panel's last labeled rows
+    base_last = panel.groupby("symbol", as_index=False).tail(1).copy()
+    base_ts_map = base_last.set_index("symbol")["timestamp"].to_dict()
+    # Use freshest engineered rows if provided; merge with panel tail so symbols missing
+    # from overrides still get predictions.
     if latest_override is not None and not latest_override.empty:
-        last = latest_override.copy()
-        # Compute avg20 per symbol from panel history (mean of last 20 vols)
-        avg20_map = panel.sort_values(["symbol","timestamp"]).groupby("symbol")["volume"].apply(lambda s: s.tail(20).mean())
-        last["avg20_vol"] = last["symbol"].map(avg20_map)
-        # Fill any NaNs with the current row's volume
-        last["avg20_vol"] = last["avg20_vol"].fillna(last["volume"]) if "volume" in last.columns else last["avg20_vol"].fillna(0)
+        override = latest_override.copy()
+        override_ts_map = override.set_index("symbol")["timestamp"].to_dict()
+        # Align schemas before merging
+        missing_in_override = [c for c in base_last.columns if c not in override.columns]
+        for c in missing_in_override:
+            override[c] = np.nan
+        missing_in_base = [c for c in override.columns if c not in base_last.columns]
+        for c in missing_in_base:
+            base_last[c] = np.nan
+        override = override[base_last.columns]
+        merged = pd.concat([base_last, override], ignore_index=True, sort=False)
+        merged = merged.sort_values(["symbol", "timestamp"]).groupby("symbol", as_index=False).tail(1)
+        last = merged.reset_index(drop=True)
+        # Report which source won for each symbol
+        chosen_src = {}
+        for _, row in last.iterrows():
+            sym = row.get("symbol")
+            ts = row.get("timestamp")
+            bts = base_ts_map.get(sym)
+            ots = override_ts_map.get(sym)
+            if ots is not None and (bts is None or ots >= bts):
+                chosen_src[sym] = ("override", ots)
+            else:
+                chosen_src[sym] = ("panel", bts)
     else:
-        last = panel.groupby("symbol", as_index=False).tail(1).copy()
+        last = base_last
+        chosen_src = {sym: ("panel", ts) for sym, ts in base_ts_map.items()}
+
+    # Compute avg20 per symbol from panel history (mean of last 20 vols)
+    avg20_map = panel.sort_values(["symbol","timestamp"]).groupby("symbol")["volume"].apply(lambda s: s.tail(20).mean())
+    last["avg20_vol"] = last["symbol"].map(avg20_map)
+    # Fill any NaNs with the current row's volume
+    last["avg20_vol"] = last["avg20_vol"].fillna(last["volume"]) if "volume" in last.columns else last["avg20_vol"].fillna(0)
+
+    latest_choice = last.groupby("symbol")["timestamp"].max().sort_index()
+    if not latest_choice.empty:
+        print("[Watchlist] Chosen timestamp per symbol (panel vs overrides):")
+        for sym, ts in latest_choice.items():
+            src, sts = chosen_src.get(sym, ("?", ts))
+            print(f"  {sym}: {ts} via {src}")
 
     X = sanitize_feature_matrix(last[feats].copy())
 
